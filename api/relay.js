@@ -1,5 +1,4 @@
 export default async function handler(req, res) {
-  // Handle preflight
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -9,29 +8,23 @@ export default async function handler(req, res) {
   }
 
   const targetUrl = req.query.url;
-  if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing "url" query parameter' });
-  }
+  if (!targetUrl) return res.status(400).json({ error: 'Missing "url" query parameter' });
 
   try {
     const response = await fetch(targetUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': '*/*',
       },
       redirect: 'follow',
     });
 
-    // Use response.url so relative paths resolve correctly even if the site redirected
-    const finalUrl = response.url; 
-    const contentType = (response.headers.get('content-type') || '').toLowerCase();
+    const finalUrl = response.url;
+    let contentType = response.headers.get('content-type') || 'text/html';
     const proxyBase = `https://${req.headers.host}/api/relay?url=`;
 
-    // Safely convert relative paths to absolute proxy paths
     const rewriteUrl = (urlStr) => {
-      if (!urlStr || urlStr.startsWith('data:') || urlStr.startsWith('javascript:') || urlStr.startsWith('#')) {
-        return urlStr;
-      }
+      if (!urlStr || urlStr.startsWith('data:') || urlStr.startsWith('javascript:') || urlStr.startsWith('#')) return urlStr;
       try {
         const absolute = new URL(urlStr, finalUrl).href;
         return proxyBase + encodeURIComponent(absolute);
@@ -43,19 +36,21 @@ export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', '*');
-    res.setHeader('Content-Type', response.headers.get('content-type') || 'text/html');
+    res.setHeader('Content-Type', contentType);
     res.setHeader('Cache-Control', 'public, max-age=60');
 
     // 1. Process HTML
     if (contentType.includes('text/html')) {
       let html = await response.text();
 
-      // Rewrite src, href, and action tags using a precise capture group
+      // Strip integrity and crossorigin attributes so SRI doesn't break proxied scripts
+      html = html.replace(/\s+(integrity|crossorigin)\s*=\s*(["']).*?\2/gi, '');
+
+      // Rewrite static tags
       html = html.replace(/\b(src|href|action)\s*=\s*(["'])(.*?)\2/gi, (match, attr, quote, val) => {
         return `${attr}=${quote}${rewriteUrl(val)}${quote}`;
       });
 
-      // Inject JS to intercept dynamic API calls, game asset fetches, and manual link clicks
       const interceptorScript = `
       <script>
         (function() {
@@ -68,7 +63,7 @@ export default async function handler(req, res) {
             catch(e) { return url; }
           }
           
-          // Intercept fetch() - Critical for web games and React/Vue apps
+          // Intercept fetch & XHR
           const originalFetch = window.fetch;
           window.fetch = function(res, init) {
             if (typeof res === 'string') res = toProxy(res);
@@ -76,13 +71,30 @@ export default async function handler(req, res) {
             return originalFetch.call(this, res, init);
           };
           
-          // Intercept XMLHttpRequest
           const originalOpen = XMLHttpRequest.prototype.open;
           XMLHttpRequest.prototype.open = function(method, url, ...args) {
             return originalOpen.call(this, method, toProxy(url), ...args);
           };
+
+          // Intercept dynamically created game assets (Images, Scripts, Audio)
+          ['src', 'href'].forEach(attr => {
+            const prototypes = [HTMLImageElement, HTMLScriptElement, HTMLAudioElement, HTMLLinkElement];
+            prototypes.forEach(proto => {
+              if (!proto) return;
+              const desc = Object.getOwnPropertyDescriptor(proto.prototype, attr);
+              if (desc && desc.set) {
+                const originalSet = desc.set;
+                Object.defineProperty(proto.prototype, attr, {
+                  set: function(val) {
+                    originalSet.call(this, toProxy(val));
+                  },
+                  get: desc.get
+                });
+              }
+            });
+          });
           
-          // Intercept raw link clicks
+          // Keep navigation inside the iframe
           document.addEventListener('click', function(e) {
             const a = e.target.closest('a');
             if (a && a.hasAttribute('href')) {
@@ -106,7 +118,6 @@ export default async function handler(req, res) {
     // 2. Process CSS
     if (contentType.includes('text/css')) {
       let css = await response.text();
-      // Intercept background-image and font url() paths
       css = css.replace(/url\(\s*(["']?)(.*?)\1\s*\)/gi, (match, quote, val) => {
         if (val.startsWith('data:')) return match;
         return `url(${quote}${rewriteUrl(val)}${quote})`;
@@ -114,10 +125,9 @@ export default async function handler(req, res) {
       return res.status(response.status).send(css);
     }
 
-    // 3. Process Binary Assets (Images, Game WebAssembly, Fonts, JS files)
+    // 3. Process Binary Assets & JS exactly as-is to avoid string corruption
     const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    return res.status(response.status).send(buffer);
+    return res.status(response.status).send(Buffer.from(arrayBuffer));
 
   } catch (error) {
     console.error('Fetch error:', error);
