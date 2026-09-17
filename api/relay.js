@@ -43,14 +43,15 @@ export default async function handler(req, res) {
     if (contentType.includes('text/html')) {
       let html = await response.text();
 
-      // Strip integrity and crossorigin attributes so SRI doesn't break proxied scripts
+      // Strip security attributes that break intercepted scripts
       html = html.replace(/\s+(integrity|crossorigin)\s*=\s*(["']).*?\2/gi, '');
 
-      // Rewrite static tags
+      // Rewrite static HTML tags
       html = html.replace(/\b(src|href|action)\s*=\s*(["'])(.*?)\2/gi, (match, attr, quote, val) => {
         return `${attr}=${quote}${rewriteUrl(val)}${quote}`;
       });
 
+      // The Interceptor Script
       const interceptorScript = `
       <script>
         (function() {
@@ -63,7 +64,7 @@ export default async function handler(req, res) {
             catch(e) { return url; }
           }
           
-          // Intercept fetch & XHR
+          // Intercept Fetch & XHR
           const originalFetch = window.fetch;
           window.fetch = function(res, init) {
             if (typeof res === 'string') res = toProxy(res);
@@ -76,9 +77,18 @@ export default async function handler(req, res) {
             return originalOpen.call(this, method, toProxy(url), ...args);
           };
 
-          // Intercept dynamically created game assets (Images, Scripts, Audio)
+          // NEW: Intercept setAttribute (Crucial for game engines loading assets)
+          const originalSetAttribute = Element.prototype.setAttribute;
+          Element.prototype.setAttribute = function(name, value) {
+            if (['src', 'href', 'action'].includes(name.toLowerCase()) && typeof value === 'string') {
+              value = toProxy(value);
+            }
+            return originalSetAttribute.call(this, name, value);
+          };
+
+          // Intercept property assignments dynamically
           ['src', 'href'].forEach(attr => {
-            const prototypes = [HTMLImageElement, HTMLScriptElement, HTMLAudioElement, HTMLLinkElement];
+            const prototypes = [HTMLImageElement, HTMLScriptElement, HTMLAudioElement, HTMLLinkElement, HTMLIFrameElement];
             prototypes.forEach(proto => {
               if (!proto) return;
               const desc = Object.getOwnPropertyDescriptor(proto.prototype, attr);
@@ -93,6 +103,14 @@ export default async function handler(req, res) {
               }
             });
           });
+
+          // NEW: Intercept Web Workers (Used for background processing)
+          if (window.Worker) {
+            const originalWorker = window.Worker;
+            window.Worker = function(url, options) {
+              return new originalWorker(toProxy(url), options);
+            };
+          }
           
           // Keep navigation inside the iframe
           document.addEventListener('click', function(e) {
@@ -125,7 +143,7 @@ export default async function handler(req, res) {
       return res.status(response.status).send(css);
     }
 
-    // 3. Process Binary Assets & JS exactly as-is to avoid string corruption
+    // 3. Process Binary Assets & Scripts
     const arrayBuffer = await response.arrayBuffer();
     return res.status(response.status).send(Buffer.from(arrayBuffer));
 
